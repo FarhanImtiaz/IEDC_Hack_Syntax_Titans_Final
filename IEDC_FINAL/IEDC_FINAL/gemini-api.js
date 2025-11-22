@@ -1,0 +1,847 @@
+/**
+ * Synapse Care Platform - Gemini API Integration
+ * Handles all interactions with Google's Gemini API for multimodal processing
+ */
+
+const GEMINI_API_KEY = typeof API_CONFIG !== 'undefined' ? API_CONFIG.GEMINI_API_KEY : null;
+const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+
+/**
+ * Converts a File object to base64 string
+ */
+async function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const base64 = reader.result.split(',')[1];
+      resolve(base64);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+/**
+ * Determines MIME type from file extension
+ */
+function getMimeType(file) {
+  const extension = file.name.split('.').pop().toLowerCase();
+  const mimeTypes = {
+    'jpg': 'image/jpeg',
+    'jpeg': 'image/jpeg',
+    'png': 'image/png',
+    'gif': 'image/gif',
+    'webp': 'image/webp',
+    'mp3': 'audio/mp3',
+    'wav': 'audio/wav',
+    'aac': 'audio/aac',
+    'ogg': 'audio/ogg',
+    'flac': 'audio/flac',
+    'm4a': 'audio/m4a'
+  };
+  return mimeTypes[extension] || file.type;
+}
+
+/**
+ * Main function to call Gemini API with multimodal input
+ * @param {string} prompt - Text prompt for the AI
+ * @param {File} file - Optional file (image or audio)
+ * @param {string} modelName - Gemini model to use
+ */
+const AVAILABLE_MODELS = [
+  'gemini-2.0-flash-lite',
+  'gemini-2.0-flash',
+  'gemini-2.5-flash',
+  'gemini-flash-lite-latest',
+  'gemini-flash-latest'
+];
+
+// Debugging: List available models
+async function listModels() {
+  try {
+    const response = await fetch(`${GEMINI_API_BASE}/models?key=${GEMINI_API_KEY}`);
+    const data = await response.json();
+    console.log('Available Gemini Models:', data.models?.map(m => m.name) || data);
+  } catch (e) {
+    console.error('Failed to list models:', e);
+  }
+}
+
+async function callGeminiAPI(prompt, file = null, modelName = 'gemini-2.0-flash') {
+  try {
+    // Ensure model name doesn't have 'models/' prefix
+    const cleanModelName = modelName.replace('models/', '');
+    const url = `${GEMINI_API_BASE}/models/${cleanModelName}:generateContent?key=${GEMINI_API_KEY}`;
+
+    let requestBody = {
+      contents: [{
+        parts: [
+          { text: prompt }
+        ]
+      }],
+      safetySettings: [
+        { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+        { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+        { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+        { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+        { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_NONE" }
+      ]
+    };
+
+    // If file is provided, add it to the request
+    if (file) {
+      const base64Data = await fileToBase64(file);
+      const mimeType = getMimeType(file);
+      requestBody.contents[0].parts.push({
+        inline_data: {
+          mime_type: mimeType,
+          data: base64Data
+        }
+      });
+    }
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody)
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      const errorMessage = errorData.error?.message || response.statusText;
+
+      if (response.status === 429) {
+        throw new Error(`RATE_LIMIT_EXCEEDED: ${errorMessage}`);
+      }
+
+      throw new Error(errorMessage);
+    }
+
+    const data = await response.json();
+
+    // Extract the text response
+    if (data.candidates && data.candidates.length > 0) {
+      const candidate = data.candidates[0];
+
+      if (candidate.finishReason && candidate.finishReason !== 'STOP') {
+        console.warn(`Content blocked: ${candidate.finishReason}`);
+        throw new Error(`Content blocked: ${candidate.finishReason}`);
+      }
+
+      if (candidate.content?.parts?.[0]?.text) {
+        return candidate.content.parts[0].text;
+      }
+    }
+
+    throw new Error('No text content in API response');
+
+  } catch (error) {
+    console.error('Gemini API Error:', error);
+    throw error;
+  }
+}
+
+/**
+ * Module 1: ET-AI Trauma Triage
+ * Analyzes trauma images and returns structured assessment
+ */
+async function analyzeTrauma(imageFile) {
+  const prompt = `You are an emergency medical AI assistant analyzing a trauma image. 
+  
+Analyze this injury image and provide a STRICT JSON response with the following structure:
+
+{
+  "severity_score": <number 1-10>,
+  "severity_level": "<LOW|MEDIUM|HIGH>",
+  "injury_type": "<description of injury type>",
+  "immediate_actions": [
+    "<step 1>",
+    "<step 2>",
+    "<step 3>"
+  ],
+  "call_emergency": <true|false>,
+  "warning_signs": [
+    "<sign 1>",
+    "<sign 2>"
+  ],
+  "assessment": "<brief clinical assessment>"
+}
+
+CRITICAL: Respond ONLY with valid JSON. No markdown, no explanation, just the JSON object.
+
+Severity Score Guide:
+- 1-3: Minor injury (LOW) - bruises, small cuts
+- 4-6: Moderate injury (MEDIUM) - deeper wounds, possible fractures
+- 7-10: Severe injury (HIGH) - life-threatening, major trauma
+
+Set call_emergency to true if severity >= 7 or life-threatening signs present.`;
+
+  const response = await callGeminiAPI(prompt, imageFile);
+
+  // Try to extract JSON from the response
+  try {
+    // Remove markdown code blocks if present
+    let jsonText = response.trim();
+    if (jsonText.startsWith('```json')) {
+      jsonText = jsonText.replace(/```json\n?/g, '').replace(/```\n?/g, '');
+    } else if (jsonText.startsWith('```')) {
+      jsonText = jsonText.replace(/```\n?/g, '');
+    }
+
+    const result = JSON.parse(jsonText);
+    return result;
+  } catch (e) {
+    console.error('Failed to parse JSON:', e);
+    console.log('Raw response:', response);
+    throw new Error('Failed to parse trauma analysis results');
+  }
+}
+
+/**
+ * Module 2: Polyglot Scribe
+ * Transcribes and translates medical consultations
+ */
+async function transcribeConsultation(audioFile) {
+  const prompt = `You are a medical scribe AI analyzing an audio recording of a doctor-patient consultation.
+
+The audio may be in various Indian languages or dialects (Hindi, Bhojpuri, Marathi, Telugu, Tamil, etc.).
+
+Provide a STRICT JSON response with the following structure:
+
+{
+  "detected_language": "<language name>",
+  "transcript_original": "<full transcript in original language>",
+  "transcript_english": "<full English translation>",
+  "chief_complaint": "<main reason for visit>",
+  "duration": "<how long has the problem existed>",
+  "symptoms": [
+    "<symptom 1>",
+    "<symptom 2>",
+    "<symptom 3>"
+  ],
+  "medical_history": "<relevant medical history mentioned>",
+  "clinical_note": "<structured clinical summary suitable for EHR>"
+}
+
+CRITICAL: Respond ONLY with valid JSON. No markdown, no explanation, just the JSON object.`;
+
+  const response = await callGeminiAPI(prompt, audioFile);
+
+  try {
+    let jsonText = response.trim();
+    if (jsonText.startsWith('```json')) {
+      jsonText = jsonText.replace(/```json\n?/g, '').replace(/```\n?/g, '');
+    } else if (jsonText.startsWith('```')) {
+      jsonText = jsonText.replace(/```\n?/g, '');
+    }
+
+    const result = JSON.parse(jsonText);
+    return result;
+  } catch (e) {
+    console.error('Failed to parse JSON:', e);
+    console.log('Raw response:', response);
+    throw new Error('Failed to parse transcription results');
+  }
+}
+
+/**
+ * Module 4: Rx-Vox
+ * OCR for prescriptions and text-to-speech conversion
+ */
+async function readPrescription(imageFile) {
+  const prompt = `You are a prescription reading AI that performs OCR on handwritten medical prescriptions.
+
+Analyze this prescription image and provide a STRICT JSON response with the following structure:
+
+{
+  "doctor_name": "<doctor's name if visible>",
+  "date": "<prescription date if visible>",
+  "patient_name": "<patient name if visible>",
+  "medications": [
+    {
+      "medicine_name": "<medication name>",
+      "dosage": "<dosage amount>",
+      "frequency": "<how often to take>",
+      "duration": "<how many days>",
+      "instructions": "<special instructions>",
+      "colloquial_instruction": "<simple language instruction for patient>"
+    }
+  ],
+  "general_advice": "<any general medical advice>",
+  "follow_up": "<follow-up instructions>"
+}
+
+CRITICAL: Respond ONLY with valid JSON. No markdown, no explanation, just the JSON object.
+
+For colloquial_instruction, write simple, clear instructions in plain English that can be easily translated to audio.
+Example: "Take one red pill every morning after breakfast with water"`;
+
+  const response = await callGeminiAPI(prompt, imageFile);
+
+  try {
+    let jsonText = response.trim();
+    if (jsonText.startsWith('```json')) {
+      jsonText = jsonText.replace(/```json\n?/g, '').replace(/```\n?/g, '');
+    } else if (jsonText.startsWith('```')) {
+      jsonText = jsonText.replace(/```\n?/g, '');
+    }
+
+    const result = JSON.parse(jsonText);
+    return result;
+  } catch (e) {
+    console.error('Failed to parse JSON:', e);
+    console.log('Raw response:', response);
+    throw new Error('Failed to parse prescription results');
+  }
+}
+
+/**
+ * Transcribe audio using Gemini (supports any length, auto-detects language)
+ * Converts a File object to a Base64 string.
+ * @param {File} file - The File object to convert.
+ * @returns {Promise<string>} A promise that resolves with the Base64 string.
+ */
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = () => {
+      // Remove the data:audio/wav;base64, prefix
+      const base64String = reader.result.split(',')[1];
+      resolve(base64String);
+    };
+    reader.onerror = error => reject(error);
+  });
+}
+
+/**
+ * Transcribe audio using Sarvam.AI STT API (supports any length, auto-detects language)
+ * @param {File} audioFile - Audio file to transcribe
+ * @returns {Object} { transcript, language_code, language }
+ */
+async function transcribeAudioWithSarvam(audioFile) {
+  console.log('🎙️ === STARTING SARVAM STT (Real-time API) ===');
+  console.log('⚠️ NOTE: Sarvam real-time API has 30-second limit');
+
+  try {
+    const maxSize = 20 * 1024 * 1024; // 20MB
+    console.log('- File size:', (audioFile.size / 1024 / 1024).toFixed(2), 'MB');
+
+    if (audioFile.size > maxSize) {
+      throw new Error(`Audio file too large (${(audioFile.size / 1024 / 1024).toFixed(2)}MB). Maximum 20MB.`);
+    }
+
+    const SARVAM_API_KEY = typeof API_CONFIG !== 'undefined' ? API_CONFIG.SARVAM_API_KEY : null;
+    if (!SARVAM_API_KEY) {
+      throw new Error('Sarvam API key not found in config.js');
+    }
+
+    const SARVAM_STT_URL = 'https://api.sarvam.ai/speech-to-text';
+    const formData = new FormData();
+    formData.append('file', audioFile);
+
+    console.log('📤 Calling Sarvam.AI STT API...');
+    const response = await fetch(SARVAM_STT_URL, {
+      method: 'POST',
+      headers: { 'API-Subscription-Key': SARVAM_API_KEY },
+      body: formData
+    });
+
+    const responseText = await response.text();
+
+    if (!response.ok) {
+      console.error('❌ API Error:', responseText);
+      let errorData = responseText;
+      try { errorData = JSON.parse(responseText); } catch (e) { }
+      throw new Error(`Sarvam STT failed (${response.status}): ${typeof errorData === 'string' ? errorData : JSON.stringify(errorData)}`);
+    }
+
+    const data = JSON.parse(responseText);
+    const languageMap = {
+      'hi': 'hi-IN', 'en': 'en-IN', 'bn': 'bn-IN', 'kn': 'kn-IN',
+      'ml': 'ml-IN', 'mr': 'mr-IN', 'or': 'od-IN', 'pa': 'pa-IN',
+      'ta': 'ta-IN', 'te': 'te-IN', 'gu': 'gu-IN'
+    };
+    const languageNameMap = {
+      'hi': 'Hindi', 'en': 'English', 'bn': 'Bengali', 'kn': 'Kannada',
+      'ml': 'Malayalam', 'mr': 'Marathi', 'or': 'Odia', 'pa': 'Punjabi',
+      'ta': 'Tamil', 'te': 'Telugu', 'gu': 'Gujarati'
+    };
+
+    const detectedCode = data.language_code || 'en';
+    const mappedCode = languageMap[detectedCode] || 'en-IN';
+    const languageName = languageNameMap[detectedCode] || 'Unknown';
+
+    console.log('✅ === SARVAM STT COMPLETE ===');
+    console.log('- Language:', languageName);
+    console.log('- Transcript length:', data.transcript?.length || 0);
+
+    return {
+      transcript: data.transcript || '',
+      language_code: mappedCode,
+      language: languageName
+    };
+  } catch (error) {
+    console.error('❌ === SARVAM STT FAILED ===');
+    console.error('- Error:', error.message);
+
+    if (error.message?.includes('duration greater than 30 seconds')) {
+      throw new Error('⏱️ Audio too long!\n\nSarvam real-time STT has a 30-second limit.\n\nFor longer audio:\n1. Use audio clips under 30 seconds, OR\n2. Contact Sarvam.AI for Batch API access (requires Python SDK)');
+    }
+
+    if (error.message?.includes('Failed to fetch')) {
+      throw new Error('Cannot connect to Sarvam.AI. Check internet and API key.');
+    }
+
+    throw new Error(`Transcription failed: ${error.message}`);
+  }
+}
+
+
+
+
+
+/**
+ * Generate Medical Summary using Gemini
+ * @param {string} transcription - Transcribed conversation
+ * @param {string} sourceLanguage - Original language
+ * @returns {Object} Structured medical summary
+ */
+async function generateMedicalSummary(transcription, sourceLanguage) {
+  console.log('🏥 generateMedicalSummary called with:');
+  console.log('- Source Language:', sourceLanguage);
+  console.log('- Transcription length:', transcription?.length || 0);
+  console.log('- Transcription preview:', transcription?.substring(0, 100) || 'EMPTY');
+
+  const prompt = `You are a medical AI assistant analyzing a doctor-patient conversation transcript.
+
+The conversation was in ${sourceLanguage}. Generate a comprehensive clinical summary suitable for doctor-to-doctor handoff.
+
+Provide a STRICT JSON response with the following structure:
+
+{
+  "chief_complaint": "<main reason for visit>",
+  "duration": "<how long has the problem existed>",
+  "symptoms": "<detailed symptom description>",
+  "medical_history": "<relevant past medical history mentioned>",
+  "physical_exam": "<physical examination findings if mentioned>",
+  "assessment": "<doctor's initial assessment or impression>",
+  "treatment_plan": "<recommended medications, procedures, or treatments>",
+  "follow_up": "<follow-up instructions and timeline>",
+  "red_flags": "<warning signs patient should watch for>"
+}
+
+CRITICAL: Respond ONLY with valid JSON. No markdown, no explanation, just the JSON object.
+
+Use professional medical terminology while remaining clear. This summary will be used by another doctor to understand the patient's case.
+
+Conversation Transcript:
+${transcription}`;
+
+  try {
+    console.log('📞 Calling Gemini API for medical summary...');
+    const response = await callGeminiAPI(prompt, null, 'gemini-2.5-flash');
+    console.log('✅ Received response from Gemini');
+    console.log('- Response length:', response?.length || 0);
+    console.log('- Response preview:', response?.substring(0, 200) || 'EMPTY');
+
+    // Parse JSON response
+    let jsonText = response.trim();
+    if (jsonText.startsWith('```json')) {
+      jsonText = jsonText.replace(/```json\n?/g, '').replace(/```\n?/g, '');
+    } else if (jsonText.startsWith('```')) {
+      jsonText = jsonText.replace(/```\n?/g, '');
+    }
+
+    console.log('🔍 Attempting to parse JSON...');
+    const result = JSON.parse(jsonText);
+    console.log('✅ Successfully parsed medical summary JSON');
+    return result;
+  } catch (error) {
+    console.error('❌ Medical summary generation error:', error);
+    console.error('- Error name:', error.name);
+    console.error('- Error message:', error.message);
+    console.error('- Error stack:', error.stack);
+    throw new Error(`Failed to generate medical summary: ${error.message}`);
+  }
+}
+
+/**
+ * Translate Medical Summary to Target Language
+ * @param {Object} summary - Medical summary object
+ * @param {string} targetLanguageCode - Target language code (e.g., 'hi-IN')
+ * @returns {Object} Translated summary
+ */
+async function translateMedicalSummary(summary, targetLanguageCode) {
+  const languageNames = {
+    'en-IN': 'English',
+    'hi-IN': 'Hindi',
+    'bn-IN': 'Bengali',
+    'kn-IN': 'Kannada',
+    'ml-IN': 'Malayalam',
+    'mr-IN': 'Marathi',
+    'od-IN': 'Odia',
+    'pa-IN': 'Punjabi',
+    'ta-IN': 'Tamil',
+    'te-IN': 'Telugu',
+    'gu-IN': 'Gujarati'
+  };
+
+  const targetLanguage = languageNames[targetLanguageCode] || 'English';
+
+  const prompt = `Translate the following medical summary to ${targetLanguage}.
+
+Maintain medical terminology accuracy and professional tone. Translate field names as well.
+
+Original Medical Summary (JSON):
+${JSON.stringify(summary, null, 2)}
+
+Provide the translated summary as JSON with the following structure:
+
+{
+  "chief_complaint": "<translated>",
+  "duration": "<translated>",
+  "symptoms": "<translated>",
+  "medical_history": "<translated>",
+  "physical_exam": "<translated>",
+  "assessment": "<translated>",
+  "treatment_plan": "<translated>",
+  "follow_up": "<translated>",
+  "red_flags": "<translated>"
+}
+
+CRITICAL: Respond ONLY with the translated JSON. No markdown, no explanation.`;
+
+  try {
+    const response = await callGeminiAPI(prompt, null, 'gemini-2.5-flash');
+
+    let jsonText = response.trim();
+    if (jsonText.startsWith('```json')) {
+      jsonText = jsonText.replace(/```json\n?/g, '').replace(/```\n?/g, '');
+    } else if (jsonText.startsWith('```')) {
+      jsonText = jsonText.replace(/```\n?/g, '');
+    }
+
+    const result = JSON.parse(jsonText);
+    return result;
+  } catch (error) {
+    console.error('Translation error:', error);
+    throw new Error('Failed to translate medical summary');
+  }
+}
+
+/**
+ * Translate text to a specific language using Gemini
+ * @param {string} text - Text to translate
+ * @param {string} targetLanguage - Target language code (e.g., 'hi-IN', 'mr-IN')
+ */
+async function translateToLanguage(text, targetLanguage) {
+  const languageNames = {
+    'en-IN': 'English',
+    'hi-IN': 'Hindi',
+    'bn-IN': 'Bengali',
+    'kn-IN': 'Kannada',
+    'ml-IN': 'Malayalam',
+    'mr-IN': 'Marathi',
+    'od-IN': 'Odia',
+    'pa-IN': 'Punjabi',
+    'ta-IN': 'Tamil',
+    'te-IN': 'Telugu',
+    'gu-IN': 'Gujarati'
+  };
+
+  const targetLangName = languageNames[targetLanguage] || 'Hindi';
+
+  const prompt = `Translate the following medical prescription instructions to ${targetLangName}. 
+  
+Use simple, colloquial language that a rural patient with limited literacy can easily understand. 
+Use common everyday words, not formal medical terminology.
+
+English text to translate:
+${text}
+
+Respond ONLY with the translated text in ${targetLangName}. No explanation, no extra text, just the translation.`;
+
+  try {
+    const response = await callGeminiAPI(prompt, null, 'gemini-2.5-flash');
+    return response.trim();
+  } catch (error) {
+    console.error('Translation error:', error);
+    throw error;
+  }
+}
+
+/**
+ * Text-to-Speech using Sarvam.ai API
+ * @param {string} text - Text to convert to speech
+ * @param {string} language - Language code (e.g., 'en-IN', 'hi-IN')
+ */
+async function textToSpeech(text, language = 'en-IN') {
+  const SARVAM_API_KEY = typeof API_CONFIG !== 'undefined' ? API_CONFIG.SARVAM_API_KEY : 'sk_bwbz2lvp_fH1cCnOrHBJb4djNaIiclkDm';
+  const SARVAM_API_URL = 'https://api.sarvam.ai/text-to-speech';
+
+  console.log('🔊 Starting TTS with Sarvam.AI...');
+  console.log('Language:', language);
+  console.log('Total text length:', text.length);
+
+  // Map language codes
+  const languageMap = {
+    'en-IN': 'en-IN',
+    'hi-IN': 'hi-IN',
+    'bn-IN': 'bn-IN',
+    'kn-IN': 'kn-IN',
+    'ml-IN': 'ml-IN',
+    'mr-IN': 'mr-IN',
+    'od-IN': 'od-IN',
+    'pa-IN': 'pa-IN',
+    'ta-IN': 'ta-IN',
+    'te-IN': 'te-IN',
+    'gu-IN': 'gu-IN'
+  };
+
+  const targetLanguage = languageMap[language] || 'en-IN';
+
+  // Helper function to call API for a single chunk
+  const callSarvamAPI = async (chunkText) => {
+    const requestBody = {
+      inputs: [chunkText],
+      target_language_code: targetLanguage,
+      speaker: 'anushka',
+      pitch: 0,
+      pace: 1.0,
+      loudness: 1.5,
+      speech_sample_rate: 8000,
+      enable_preprocessing: true,
+      model: 'bulbul:v2'
+    };
+
+    const response = await fetch(SARVAM_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'api-subscription-key': SARVAM_API_KEY
+      },
+      body: JSON.stringify(requestBody)
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      console.error('Sarvam.AI Error Response:', errorData);
+      throw new Error(`Sarvam.ai API Error (${response.status}): ${JSON.stringify(errorData)}`);
+    }
+
+    const data = await response.json();
+    if (data.audios && data.audios.length > 0) {
+      return data.audios[0];
+    }
+    throw new Error('No audio generated');
+  };
+
+  // Helper function to split text into chunks intelligently
+  const splitTextIntoChunks = (fullText) => {
+    const HARD_LIMIT = 250; // Reduced to 250 for absolute safety with Sarvam
+    const totalLength = fullText.length;
+
+    // 1. Plan the strategy
+    const minChunks = Math.ceil(totalLength / HARD_LIMIT);
+    const targetChunks = totalLength > 500 ? minChunks + 1 : minChunks;
+    const targetChunkSize = Math.ceil(totalLength / targetChunks);
+
+    console.log('📊 Audio Chunking Plan (Strict Mode):');
+    console.log(`- Total Length: ${totalLength} chars`);
+    console.log(`- Target Sections: ${targetChunks}`);
+    console.log(`- Target Size: ~${targetChunkSize} chars`);
+    console.log(`- Hard Limit: ${HARD_LIMIT} chars`);
+
+    const chunks = [];
+    let currentChunk = '';
+
+    // Split by sentences first
+    const sentences = fullText.match(/[^.!?]+[.!?]+(\s+|$)|[^.!?]+$/g) || [fullText];
+
+    for (const sentence of sentences) {
+      if ((currentChunk + sentence).length > HARD_LIMIT) {
+        if (currentChunk) {
+          chunks.push(currentChunk.trim());
+          currentChunk = '';
+        }
+
+        if (sentence.length > HARD_LIMIT) {
+          // Split huge sentences by clauses
+          const clauses = sentence.match(/[^,;]+[,;]+(\s+|$)|[^,;]+$/g) || [sentence];
+          for (const clause of clauses) {
+            if ((currentChunk + clause).length > HARD_LIMIT) {
+              if (currentChunk) chunks.push(currentChunk.trim());
+              currentChunk = clause;
+
+              // Fallback: Split by words
+              if (currentChunk.length > HARD_LIMIT) {
+                const words = currentChunk.split(' ');
+                currentChunk = '';
+                for (const word of words) {
+                  if ((currentChunk + ' ' + word).length <= HARD_LIMIT) {
+                    currentChunk += (currentChunk ? ' ' : '') + word;
+                  } else {
+                    chunks.push(currentChunk.trim());
+                    currentChunk = word;
+                  }
+                }
+              }
+            } else {
+              currentChunk += clause;
+            }
+          }
+        } else {
+          currentChunk = sentence;
+        }
+      }
+      else if (currentChunk.length >= targetChunkSize && (currentChunk + sentence).length <= HARD_LIMIT) {
+        chunks.push(currentChunk.trim());
+        currentChunk = sentence;
+      }
+      else {
+        currentChunk += sentence;
+      }
+    }
+    if (currentChunk && currentChunk.trim().length > 0) {
+      chunks.push(currentChunk.trim());
+    }
+
+    // Verification
+    console.log('✅ Chunking Complete:');
+    chunks.forEach((c, i) => console.log(`  • Section ${i + 1}: ${c.length} chars`));
+
+    return chunks;
+  };
+
+  try {
+    // Split text
+    const chunks = splitTextIntoChunks(text);
+    console.log(`Processing ${chunks.length} audio sections...`);
+
+    // Process chunks sequentially with delays
+    for (let i = 0; i < chunks.length; i++) {
+      console.log(`▶️ Playing Section ${i + 1}/${chunks.length}...`);
+
+      const base64Audio = await callSarvamAPI(chunks[i]);
+      const audioBlob = base64ToBlob(base64Audio, 'audio/wav');
+      const audioUrl = URL.createObjectURL(audioBlob);
+
+      await new Promise((resolve, reject) => {
+        const audio = new Audio(audioUrl);
+
+        // Add small delay after playback finishes to prevent overlap/cutoff
+        audio.onended = () => {
+          console.log(`✅ Section ${i + 1} finished`);
+          URL.revokeObjectURL(audioUrl);
+          setTimeout(resolve, 500); // 500ms delay between chunks
+        };
+
+        audio.onerror = (e) => {
+          console.error(`❌ Section ${i + 1} failed`, e);
+          URL.revokeObjectURL(audioUrl);
+          reject(e);
+        };
+
+        audio.play().catch(reject);
+      });
+    }
+
+    console.log('🎉 All audio sections completed!');
+
+  } catch (error) {
+    console.error('❌ Sarvam.ai TTS Error:', error);
+    throw error;
+  }
+}
+
+/**
+ * Convert base64 string to Blob
+ */
+function base64ToBlob(base64, mimeType) {
+  const byteCharacters = atob(base64);
+  const byteNumbers = new Array(byteCharacters.length);
+  for (let i = 0; i < byteCharacters.length; i++) {
+    byteNumbers[i] = byteCharacters.charCodeAt(i);
+  }
+  const byteArray = new Uint8Array(byteNumbers);
+  return new Blob([byteArray], { type: mimeType });
+}
+
+// Export functions for use in app.js
+/**
+ * Translate trauma assessment to target language
+ * @param {Object} traumaData - The trauma assessment data
+ * @param {string} targetLanguageCode - Target language code
+ */
+async function translateTraumaAssessment(traumaData, targetLanguageCode) {
+  const languageNames = {
+    'en-IN': 'English',
+    'hi-IN': 'Hindi',
+    'bn-IN': 'Bengali',
+    'kn-IN': 'Kannada',
+    'ml-IN': 'Malayalam',
+    'mr-IN': 'Marathi',
+    'od-IN': 'Odia',
+    'pa-IN': 'Punjabi',
+    'ta-IN': 'Tamil',
+    'te-IN': 'Telugu',
+    'gu-IN': 'Gujarati'
+  };
+
+  const targetLangName = languageNames[targetLanguageCode] || 'Hindi';
+
+  // Safely access properties (handle both snake_case from API and camelCase if mapped)
+  const severity = traumaData.severity_score || traumaData.severityScore || 'Unknown';
+  const assessment = traumaData.assessment || traumaData.clinicalAssessment || 'No assessment provided';
+
+  // Ensure arrays exist before joining
+  const actionSteps = Array.isArray(traumaData.immediate_actions) ? traumaData.immediate_actions :
+    (Array.isArray(traumaData.actionSteps) ? traumaData.actionSteps : []);
+
+  const warnings = Array.isArray(traumaData.warning_signs) ? traumaData.warning_signs :
+    (Array.isArray(traumaData.warningSigns) ? traumaData.warningSigns : []);
+
+  const prompt = `
+  You are a helpful medical assistant for rural India.
+  Translate the following trauma assessment summary into ${targetLangName}.
+  
+  IMPORTANT:
+  1. Use simple, colloquial language that a rural villager can understand.
+  2. Avoid complex medical jargon.
+  3. The output will be spoken out loud, so make it sound natural.
+  4. Structure it clearly:
+     - First, state the severity (Critical/Moderate/Mild).
+     - Then, give the immediate first aid steps.
+     - Finally, mention any warning signs.
+
+  Input Data:
+  Severity: ${severity}/10
+  Assessment: ${assessment}
+  Action Steps: ${actionSteps.join(', ')}
+  Warnings: ${warnings.join(', ')}
+
+  Respond ONLY with the translated text. Do not add "Here is the translation" or markdown formatting.
+  `;
+
+  try {
+    const response = await callGeminiAPI(prompt, null, 'gemini-2.5-flash');
+    return response.trim();
+  } catch (error) {
+    console.error('Trauma translation error:', error);
+    throw new Error('Failed to translate trauma assessment');
+  }
+}
+
+// Export functions for use in app.js
+window.GeminiAPI = {
+  analyzeTrauma,
+  transcribeConsultation,
+  readPrescription,
+  translateToLanguage,
+  textToSpeech,
+  transcribeAudioWithSarvam,
+  generateMedicalSummary,
+  translateMedicalSummary,
+  translateTraumaAssessment
+};
